@@ -5,6 +5,10 @@ import shutil
 import time
 import warnings
 
+from tqdm.auto import tqdm
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import glob
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -207,7 +211,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                      amsgrad=False)
 
     # prepare dataset
-    train_loader, train_sampler, val_loader, cali_loader = prepare_dataloader(args)
+    train_loader, train_sampler, val_loader, cali_loader = tf_prepare_dataloader(args)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -282,54 +286,117 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
 
-def prepare_dataloader(args):
-    traindir = os.path.join(args.train_data, 'train')
-    valdir = os.path.join(args.val_data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+def decode(serialized_example):
+    image_shape = (224, 224)
+    features = tf.io.parse_single_example(
+        serialized_example,
+        features={
+            'image/encoded': tf.io.FixedLenFeature([], tf.string),
+            'image/class/label': tf.io.FixedLenFeature([], tf.int64),
+        })
+    image = tf.image.decode_jpeg(features['image/encoded'], channels=3)
+    image = tf.image.resize_with_pad(image, *image_shape)  # crop/augment instead
+    image = tf.transpose(image, perm=[2, 0, 1])
+    image = image - [[[123.675]], [[116.28]], [[103.53]]]
+    image = image / [[[58.395]], [[57.12]], [[57.375]]]
+    label = tf.cast(features['image/class/label'], tf.int64) - 1  # [0-999]
+    return image, label
 
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
+def get_dataset(files, batch_size, repeat=1, shuffle=False):
+    def create_ds(tfrecords, batch_size=8):
+        dataset = tf.data.TFRecordDataset(tfrecords, num_parallel_reads=tf.data.AUTOTUNE)
+        dataset = dataset.map(decode, num_parallel_calls=tf.data.AUTOTUNE)
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=50)
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        dataset = dataset.repeat(repeat)
+        return dataset
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    files = sorted(glob.glob(files))
+    return create_ds(files, batch_size=batch_size)
 
-    cali_batch_size = 10
-    cali_batch = 10
-    cali_dataset = torch.utils.data.Subset(train_dataset, indices=torch.arange(cali_batch_size * cali_batch))
-    cali_loader = torch.utils.data.DataLoader(cali_dataset, batch_size=cali_batch_size, shuffle=False,
-                                                num_workers=args.workers, pin_memory=True)
+def count_data_items(files):
+    files = sorted(glob.glob(files))
+    num_ds = tf.data.TFRecordDataset(files, num_parallel_reads=tf.data.AUTOTUNE)
+    num_ds = num_ds.map(decode, num_parallel_calls=tf.data.AUTOTUNE)
+    num_ds = num_ds.repeat(1)
+    num_ds = num_ds.batch(1)
 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    c = 0
+    for _ in tqdm(num_ds):
+        c += 1
+    del num_ds
+    return c
 
-    return train_loader, train_sampler, val_loader, cali_loader
+class TFRecordDataLoader:
+    def __init__(self, files, batch_size=16, repeat=1, shuffle=False,
+                 ds_len=None, at_most=None):
+        self.ds = get_dataset(
+            files,
+            batch_size=batch_size,
+            repeat=repeat,
+            shuffle=shuffle)
+        if at_most:
+            self.ds = self.ds.take(at_most)
+        self.ds = tfds.as_numpy(self.ds)
+
+        if ds_len:
+            self.num_examples = ds_len
+        else:
+            self.num_examples = count_data_items(files)
+        self.batch_size = batch_size
+        self._iterator = None
+
+    def __iter__(self):
+        if self._iterator is None:
+            self._iterator = iter(self.ds)
+        else:
+            self._reset()
+        return self._iterator
+
+    def _reset(self):
+        self._iterator = iter(self.ds)
+
+    def __next__(self):
+        batch = next(self._iterator)
+        return batch
+
+    def __len__(self):
+        n_batches = self.num_examples // self.batch_size
+        if self.num_examples % self.batch_size == 0:
+            return n_batches
+        else:
+            return n_batches + 1
+
+def tf_prepare_dataloader(args):
+    train_files = args.train_data
+    valid_files = args.val_data
+    train_loader = TFRecordDataLoader(train_files,
+                                      batch_size=args.batch_size,
+                                      shuffle=True,
+                                      ds_len=1281167)
+
+    valid_loader = TFRecordDataLoader(valid_files,
+                                      batch_size=args.batch_size,
+                                      shuffle=True,
+                                      ds_len=50000)
+
+    calib_loader = TFRecordDataLoader(train_files,
+                                      batch_size=10,
+                                      shuffle=True,
+                                      ds_len=100,
+                                      at_most=10)
+    return train_loader, None, valid_loader, calib_loader
 
 def calibrate(cali_loader, model, args):
     model.eval()
     print("Start calibration ...")
-    print("Calibrate images number = ", len(cali_loader.dataset))
+    print("Calibrate images batch number = ", len(cali_loader))
     with torch.no_grad():
         for i, (images, target) in enumerate(cali_loader):
+            images = torch.from_numpy(images)
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             output = model(images)
@@ -353,6 +420,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
+        images = torch.from_numpy(images)
+        target = torch.from_numpy(target)
         # measure data loading time
         data_time.update(time.time() - end)
 
