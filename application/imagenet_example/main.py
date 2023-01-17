@@ -5,6 +5,10 @@ import shutil
 import time
 import warnings
 
+import cv2
+import numpy as np
+from PIL import Image
+from tfrecord.torch.dataset import MultiTFRecordDataset
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -283,28 +287,48 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 def prepare_dataloader(args):
-    traindir = os.path.join(args.train_data, 'train')
-    valdir = os.path.join(args.val_data, 'val')
+    traindir = os.path.join(args.train_data, 'train-{}-of-01024')
+    valdir = os.path.join(args.val_data, 'validation-{}-of-01024')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+    splits = {}
+    for i in range(1024):
+        splits["{:0>5d}".format(i)] = 1/1024
+
+    def decode_image(features):
+        # get BGR image from bytes
+        img = cv2.imdecode(features["image/encoded"], cv2.IMREAD_COLOR)
+        img = Image.fromarray(img)
+        # img = Image.open(io.BytesIO(features["image/encoded"]))
+        img = transforms.RandomResizedCrop(224).forward(img)
+        img = transforms.CenterCrop(224).forward(img)
+        img = transforms.ToTensor()(img)
+        img = normalize.forward(img)
+
+        return np.asarray(img), features['image/class/label'][0] - 1
+
+    description = {"image/encoded": "byte", "image/class/label": "int"}
+    train_dataset = MultiTFRecordDataset(traindir, None, splits, description, transform=decode_image,
+                                         shuffle_queue_size=1024)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size)
+    # train_dataset = datasets.ImageFolder(
+    #     traindir,
+    #     transforms.Compose([
+    #         transforms.RandomResizedCrop(224),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         normalize,
+    #     ]))
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+    #     num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     cali_batch_size = 10
     cali_batch = 10
@@ -312,28 +336,53 @@ def prepare_dataloader(args):
     cali_loader = torch.utils.data.DataLoader(cali_dataset, batch_size=cali_batch_size, shuffle=False,
                                                 num_workers=args.workers, pin_memory=True)
 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    # val_loader = torch.utils.data.DataLoader(
+    #     datasets.ImageFolder(valdir, transforms.Compose([
+    #         transforms.Resize(256),
+    #         transforms.CenterCrop(224),
+    #         transforms.ToTensor(),
+    #         normalize,
+    #     ])),
+    #     batch_size=args.batch_size, shuffle=False,
+    #     num_workers=args.workers, pin_memory=True)
 
-    return train_loader, train_sampler, val_loader, cali_loader
+    splits = {}
+    for i in range(128):
+        splits["{:0>5d}".format(i)] = 1/128
+
+    def decode_image(features):
+        # get BGR image from bytes
+        img = cv2.imdecode(features["image/encoded"], cv2.IMREAD_COLOR)
+        img = Image.fromarray(img)
+        # img = Image.open(io.BytesIO(features["image/encoded"]))
+        img = transforms.Resize(256).forward(img)
+        img = transforms.CenterCrop(224).forward(img)
+        img = transforms.ToTensor()(img)
+        img = normalize.forward(img)
+
+        return np.asarray(img), features['image/class/label'][0] - 1
+
+    description = {"image/encoded": "byte", "image/class/label": "int"}
+    val_dataset = MultiTFRecordDataset(valdir, None, splits, description, transform=decode_image,
+                                       shuffle_queue_size=1024)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size)
+
+    return train_loader, train_sampler, val_loader, train_loader
+
 
 def calibrate(cali_loader, model, args):
     model.eval()
     print("Start calibration ...")
-    print("Calibrate images number = ", len(cali_loader.dataset))
+    # print("Calibrate images batch number = ", len(cali_loader))
     with torch.no_grad():
         for i, (images, target) in enumerate(cali_loader):
+            # images = torch.from_numpy(images[:10])
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             output = model(images)
             print("Calibration ==> ", i+1)
+            if i >= 10:
+                break
     print("End calibration.")
     return
 
@@ -344,7 +393,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
-        len(train_loader),
+        1281167,
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
@@ -353,7 +402,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
+        # images = torch.from_numpy(images)
+        # target = torch.from_numpy(target)
         # measure data loading time
+        print(images)
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
@@ -363,6 +415,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # compute output
         output = model(images)
+        # print(output)
+        # print(target)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
